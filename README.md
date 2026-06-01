@@ -1,5 +1,7 @@
 # nanochat
 
+made a copy since I thought the "new chat" token could be a buffer in the positional embedding
+
 ![nanochat logo](dev/nanochat.png)
 
 > The best ChatGPT that $100 can buy.
