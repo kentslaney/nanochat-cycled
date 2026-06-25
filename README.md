@@ -1,6 +1,6 @@
 # nanochat
 
-made a copy since I thought the "new chat" token could be a buffer in the positional embedding
+made a copy since I [thought](https://github.com/karpathy/nanochat/discussions/1#discussioncomment-14766333) the "new chat" token could be a buffer in the positional embedding
 
 ![nanochat logo](dev/nanochat.png)
 ![scaling laws](dev/scaling_laws_jan26.png)
