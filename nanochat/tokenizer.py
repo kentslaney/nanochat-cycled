@@ -253,6 +253,41 @@ class RustBPETokenizer:
             return ids, mask, positions
         return ids, mask
 
+    def visualize_tokenization(self, ids, mask, with_token_id=False):
+        """Small helper function useful in debugging: visualize the tokenization of render_conversation"""
+        RED = '\033[91m'
+        GREEN = '\033[92m'
+        RESET = '\033[0m'
+        GRAY = '\033[90m'
+        tokens = []
+        for i, (token_id, mask_val) in enumerate(zip(ids, mask)):
+            token_str = self.decode([token_id])
+            color = GREEN if mask_val == 1 else RED
+            tokens.append(f"{color}{token_str}{RESET}")
+            if with_token_id:
+                tokens.append(f"{GRAY}({token_id}){RESET}")
+        return '|'.join(tokens)
+
+    def render_for_completion(self, conversation):
+        """
+        Used during Reinforcement Learning. In that setting, we want to
+        render the conversation priming the Assistant for a completion.
+        Unlike the Chat SFT case, we don't need to return the mask.
+        """
+        # We have some surgery to do: we need to pop the last message (of the Assistant)
+        conversation = copy.deepcopy(conversation) # avoid mutating the original
+        messages = conversation["messages"]
+        assert messages[-1]["role"] == "assistant", "Last message must be from the Assistant"
+        messages.pop() # remove the last message (of the Assistant) inplace
+
+        # Now tokenize the conversation
+        ids, mask = self.render_conversation(conversation)
+
+        # Finally, to prime the Assistant for a completion, append the Assistant start token
+        assistant_start = self.encode_special("<|assistant_start|>")
+        ids.append(assistant_start)
+        return ids
+
 
 def compute_conversation_position_ids(token_ids, tokenizer, message_stride=512):
     """
@@ -300,41 +335,6 @@ def compute_conversation_position_ids(token_ids, tokenizer, message_stride=512):
             after_output_end = True
 
     return positions
-
-    def visualize_tokenization(self, ids, mask, with_token_id=False):
-        """Small helper function useful in debugging: visualize the tokenization of render_conversation"""
-        RED = '\033[91m'
-        GREEN = '\033[92m'
-        RESET = '\033[0m'
-        GRAY = '\033[90m'
-        tokens = []
-        for i, (token_id, mask_val) in enumerate(zip(ids, mask)):
-            token_str = self.decode([token_id])
-            color = GREEN if mask_val == 1 else RED
-            tokens.append(f"{color}{token_str}{RESET}")
-            if with_token_id:
-                tokens.append(f"{GRAY}({token_id}){RESET}")
-        return '|'.join(tokens)
-
-    def render_for_completion(self, conversation):
-        """
-        Used during Reinforcement Learning. In that setting, we want to
-        render the conversation priming the Assistant for a completion.
-        Unlike the Chat SFT case, we don't need to return the mask.
-        """
-        # We have some surgery to do: we need to pop the last message (of the Assistant)
-        conversation = copy.deepcopy(conversation) # avoid mutating the original
-        messages = conversation["messages"]
-        assert messages[-1]["role"] == "assistant", "Last message must be from the Assistant"
-        messages.pop() # remove the last message (of the Assistant) inplace
-
-        # Now tokenize the conversation
-        ids, mask = self.render_conversation(conversation)
-
-        # Finally, to prime the Assistant for a completion, append the Assistant start token
-        assistant_start = self.encode_special("<|assistant_start|>")
-        ids.append(assistant_start)
-        return ids
 
 # -----------------------------------------------------------------------------
 # nanochat-specific convenience functions
