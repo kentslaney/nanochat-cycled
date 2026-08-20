@@ -263,20 +263,46 @@ class RustBPETokenizer:
             pickle.dump(self.enc, f)
         print(f"Saved tokenizer encoding to {pickle_path}")
 
-    def render_conversation(self, conversation, max_tokens=2048):
+    def compute_position_ids(self, token_ids, message_stride=512):
+        """Compute position IDs for token_ids with speaker parity alignment."""
+        return compute_conversation_position_ids(token_ids, self, message_stride)
+
+    def render_conversation(self, conversation, max_tokens=2048, message_stride=0, return_positions=False):
         """
         Tokenize a single Chat conversation (which we call a "doc" or "document" here).
         Returns:
         - ids: list[int] is a list of token ids of this rendered conversation
         - mask: list[int] of same length, mask = 1 for tokens that the Assistant is expected to train on.
+        - positions (optional if return_positions=True): list[int] of position ids with parity alignment.
         """
-        # ids, masks that we will return and a helper function to help build them up.
-        ids, mask = [], []
-        def add_tokens(token_ids, mask_val):
+        # ids, masks, positions that we will return and a helper function to help build them up.
+        ids, mask, positions = [], [], []
+        current_pos = 0
+
+        def add_tokens(token_ids, mask_val, turn_type=None):
+            nonlocal current_pos
             if isinstance(token_ids, int):
                 token_ids = [token_ids]
-            ids.extend(token_ids)
-            mask.extend([mask_val] * len(token_ids))
+            if message_stride > 0 and turn_type is not None:
+                if turn_type in ("user", "output"):
+                    # Align to next even multiple >= current_pos
+                    if current_pos > 1:
+                        k = (current_pos + 2 * message_stride - 1) // (2 * message_stride)
+                        current_pos = k * 2 * message_stride
+                elif turn_type in ("assistant", "python"):
+                    # Align to next odd multiple >= current_pos
+                    rem = current_pos - message_stride
+                    if rem <= 0:
+                        current_pos = message_stride
+                    else:
+                        k = (rem + 2 * message_stride - 1) // (2 * message_stride)
+                        current_pos = (2 * k + 1) * message_stride
+
+            for tid in token_ids:
+                ids.append(tid)
+                mask.append(mask_val)
+                positions.append(current_pos)
+                current_pos += 1
 
         # sometimes the first message is a system message...
         # => just merge it with the second (user) message
@@ -312,16 +338,17 @@ class RustBPETokenizer:
             if message["role"] == "user":
                 assert isinstance(content, str), "User messages are simply expected to be strings"
                 value_ids = self.encode(content)
-                add_tokens(user_start, 0)
+                add_tokens(user_start, 0, turn_type="user")
                 add_tokens(value_ids, 0)
                 add_tokens(user_end, 0)
             elif message["role"] == "assistant":
-                add_tokens(assistant_start, 0)
                 if isinstance(content, str):
                     # simple string => simply add the tokens
                     value_ids = self.encode(content)
+                    add_tokens(assistant_start, 0, turn_type="assistant")
                     add_tokens(value_ids, 1)
                 elif isinstance(content, list):
+                    add_tokens(assistant_start, 0, turn_type="assistant")
                     for part in content:
                         value_ids = self.encode(part["text"])
                         if part["type"] == "text":
@@ -329,13 +356,13 @@ class RustBPETokenizer:
                             add_tokens(value_ids, 1)
                         elif part["type"] == "python":
                             # python tool call => add the tokens inside <|python_start|> and <|python_end|>
-                            add_tokens(python_start, 1)
+                            add_tokens(python_start, 1, turn_type="python")
                             add_tokens(value_ids, 1)
                             add_tokens(python_end, 1)
                         elif part["type"] == "python_output":
                             # python output => add the tokens inside <|output_start|> and <|output_end|>
                             # none of these tokens are supervised because the tokens come from Python at test time
-                            add_tokens(output_start, 0)
+                            add_tokens(output_start, 0, turn_type="output")
                             add_tokens(value_ids, 0)
                             add_tokens(output_end, 0)
                         else:
@@ -347,7 +374,58 @@ class RustBPETokenizer:
         # truncate to max_tokens tokens MAX (helps prevent OOMs)
         ids = ids[:max_tokens]
         mask = mask[:max_tokens]
+        positions = positions[:max_tokens]
+        if return_positions:
+            return ids, mask, positions
         return ids, mask
+
+
+def compute_conversation_position_ids(token_ids, tokenizer, message_stride=512):
+    """
+    Compute position IDs for a sequence of conversation tokens with speaker parity alignment.
+    - User turns (and BOS / output_start) align to even multiples: 2k * message_stride (0, 2M, 4M, ...)
+    - Assistant turns (and post-tool continuation) align to odd multiples: (2k + 1) * message_stride (M, 3M, 5M, ...)
+    - If message_stride <= 0, returns standard contiguous positions: list(range(len(token_ids)))
+    """
+    if message_stride <= 0 or not token_ids:
+        return list(range(len(token_ids)))
+
+    user_start = tokenizer.encode_special("<|user_start|>")
+    output_start = tokenizer.encode_special("<|output_start|>")
+    output_end = tokenizer.encode_special("<|output_end|>")
+    assistant_start = tokenizer.encode_special("<|assistant_start|>")
+    assistant_end = tokenizer.encode_special("<|assistant_end|>")
+    bos = tokenizer.get_bos_token_id()
+
+    positions = []
+    current_pos = 0
+    after_output_end = False
+
+    for i, token in enumerate(token_ids):
+        if i == 0:
+            current_pos = 0
+        elif token in (user_start, output_start):
+            after_output_end = False
+            # Align to next available even multiple >= current_pos
+            if current_pos > 1:
+                k = (current_pos + 2 * message_stride - 1) // (2 * message_stride)
+                current_pos = k * 2 * message_stride
+        elif token == assistant_start or after_output_end:
+            after_output_end = False
+            # Align to next available odd multiple >= current_pos
+            rem = current_pos - message_stride
+            if rem <= 0:
+                current_pos = message_stride
+            else:
+                k = (rem + 2 * message_stride - 1) // (2 * message_stride)
+                current_pos = (2 * k + 1) * message_stride
+
+        positions.append(current_pos)
+        current_pos += 1
+        if token == output_end:
+            after_output_end = True
+
+    return positions
 
     def visualize_tokenization(self, ids, mask, with_token_id=False):
         """Small helper function useful in debugging: visualize the tokenization of render_conversation"""

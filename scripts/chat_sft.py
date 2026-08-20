@@ -66,6 +66,7 @@ parser.add_argument("--chatcore-max-sample", type=int, default=24, help="max pro
 # Data mixture
 parser.add_argument("--mmlu-epochs", type=int, default=3, help="number of epochs of MMLU in training mixture (teaches Multiple Choice)")
 parser.add_argument("--gsm8k-epochs", type=int, default=4, help="number of epochs of GSM8K in training mixture (teaches Math and Tool Use)")
+parser.add_argument("--message-stride", type=int, default=0, help="message stride for cycled RoPE (0 = standard contiguous)")
 args = parser.parse_args()
 user_config = vars(args).copy()
 # -----------------------------------------------------------------------------
@@ -201,7 +202,7 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
     row_capacity = args.max_seq_len + 1  # +1 for target at last position
     bos_token = tokenizer.get_bos_token_id()
 
-    # Conversation buffer: list of (token_ids, loss_mask) tuples
+    # Conversation buffer: list of (token_ids, loss_mask, pos_ids) tuples
     conv_buffer = []
     cursor = ddp_rank  # Each rank processes different conversations (for fetching)
     consumed = ddp_rank  # Track actual consumption separately from buffering
@@ -212,8 +213,12 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
         nonlocal cursor, epoch
         while len(conv_buffer) < buffer_size:
             conversation = dataset[cursor]
-            ids, mask = tokenizer.render_conversation(conversation)
-            conv_buffer.append((ids, mask))
+            if args.message_stride > 0:
+                ids, mask, pos = tokenizer.render_conversation(conversation, message_stride=args.message_stride, return_positions=True)
+            else:
+                ids, mask = tokenizer.render_conversation(conversation)
+                pos = list(range(len(ids)))
+            conv_buffer.append((ids, mask, pos))
             cursor += ddp_world_size
             if cursor >= dataset_size:
                 cursor = cursor % dataset_size
@@ -223,10 +228,12 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
     while True:
         rows = []
         mask_rows = []
+        pos_rows = []
         row_lengths = []  # Track actual content length (excluding padding) for each row
         for _ in range(args.device_batch_size):
             row = []
             mask_row = []
+            pos_row = []
             padded = False
             while len(row) < row_capacity:
                 # Ensure buffer has conversations
@@ -238,7 +245,7 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
                 # Find largest conversation that fits entirely
                 best_idx = -1
                 best_len = 0
-                for i, (conv, _) in enumerate(conv_buffer):
+                for i, (conv, _, _) in enumerate(conv_buffer):
                     conv_len = len(conv)
                     if conv_len <= remaining and conv_len > best_len:
                         best_idx = i
@@ -246,9 +253,10 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
 
                 if best_idx >= 0:
                     # Found a conversation that fits - use it entirely
-                    conv, conv_mask = conv_buffer.pop(best_idx)
+                    conv, conv_mask, conv_pos = conv_buffer.pop(best_idx)
                     row.extend(conv)
                     mask_row.extend(conv_mask)
+                    pos_row.extend(conv_pos)
                     consumed += ddp_world_size  # Track actual consumption
                 else:
                     # No conversation fits - pad the remainder instead of cropping
@@ -256,6 +264,7 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
                     content_len = len(row)
                     row.extend([bos_token] * remaining)  # Pad with BOS tokens
                     mask_row.extend([0] * remaining)
+                    pos_row.extend([0] * remaining)
                     padded = True
                     break  # Row is now full (with padding)
 
@@ -266,6 +275,7 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
                 row_lengths.append(row_capacity)
             rows.append(row[:row_capacity])
             mask_rows.append(mask_row[:row_capacity])
+            pos_rows.append(pos_row[:row_capacity])
 
         # Stopping condition to respect num_iterations, if given
         it += 1
@@ -289,6 +299,12 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
         inputs = batch_tensor[:, :-1].to(device=device, dtype=torch.int32, non_blocking=use_cuda).contiguous()
         targets = batch_tensor[:, 1:].to(device=device, dtype=torch.int64, non_blocking=use_cuda).contiguous()
 
+        if args.message_stride > 0:
+            pos_tensor = torch.tensor(pos_rows, dtype=torch.long, pin_memory=use_cuda)
+            position_ids = pos_tensor[:, :-1].to(device=device, dtype=torch.int64, non_blocking=use_cuda).contiguous()
+        else:
+            position_ids = None
+
         # Apply the loss mask from render_conversation (mask=1 for assistant completions,
         # mask=0 for user prompts, BOS, special tokens, tool outputs). mask[1:] aligns
         # with targets (shifted by 1). Unmasked positions get -1 (ignore_index).
@@ -302,7 +318,7 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
             if content_len < row_capacity:
                 targets[i, content_len-1:] = -1
 
-        yield inputs, targets
+        yield inputs, targets, position_ids
 
 train_loader = sft_data_generator_bos_bestfit("train")
 build_val_loader = lambda: sft_data_generator_bos_bestfit("val")
@@ -328,7 +344,8 @@ def get_muon_momentum(it):
 
 # -----------------------------------------------------------------------------
 # Training loop
-x, y = next(train_loader) # prefetch the very first batch of data
+batch = next(train_loader) # prefetch the very first batch of data
+x, y, pos = batch if len(batch) == 3 else (batch[0], batch[1], None)
 min_val_bpb = float("inf")
 smooth_train_loss = 0 # EMA of training loss
 ema_beta = 0.9 # EMA decay factor
@@ -415,6 +432,7 @@ while True:
                     "n_kv_head": model.config.n_kv_head,
                     "n_embd": model.config.n_embd,
                     "window_pattern": model.config.window_pattern,
+                    "message_stride": args.message_stride,
                 },
                 "user_config": user_config, # inputs to the training script
             },
@@ -430,14 +448,15 @@ while True:
     synchronize()
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
-        loss = model(x, y)
+        loss = model(x, y, position_ids=pos)
         train_loss = loss.detach() # for logging
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         if scaler is not None:
             scaler.scale(loss).backward()
         else:
             loss.backward()
-        x, y = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
+        batch = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
+        x, y, pos = batch if len(batch) == 3 else (batch[0], batch[1], None)
         progress = max(progress, approx_progress) # only increase progress monotonically
     # step the optimizer
     lrm = get_lr_multiplier(progress)

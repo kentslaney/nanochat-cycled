@@ -37,6 +37,7 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (quarter context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    message_stride: int = 0 # 0 = standard contiguous positions, >0 = message stride (e.g. 512)
 
 
 def norm(x):
@@ -192,7 +193,8 @@ class GPT(nn.Module):
         # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
         # so let's just over-compute them by 10X, but assert fail if we ever reach that amount.
         # In the future we can dynamically grow the cache, for now it's fine.
-        self.rotary_seq_len = config.sequence_len * 10 # 10X over-compute should be enough, TODO make nicer?
+        stride_len = (config.message_stride * 32) if config.message_stride > 0 else 0
+        self.rotary_seq_len = max(config.sequence_len * 10, stride_len) # over-compute to accommodate long sequences or message strides
         head_dim = config.n_embd // config.n_head
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
         self.register_buffer("cos", cos, persistent=False) # persistent=False means it's not saved to the checkpoint
@@ -413,16 +415,28 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
+    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', position_ids=None):
         B, T = idx.size()
 
-        # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
-        assert T <= self.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {T} > {self.cos.size(1)}"
+        # Grab the rotary embeddings for the current sequence length
         assert idx.device == self.cos.device, f"Rotary embeddings and idx are on different devices: {idx.device} != {self.cos.device}"
         assert self.cos.dtype == COMPUTE_DTYPE, f"Rotary embeddings must be in {COMPUTE_DTYPE}, got {self.cos.dtype}"
-        # if kv cache exists, we need to offset the rotary embeddings to the current position in the cache
-        T0 = 0 if kv_cache is None else kv_cache.get_pos()
-        cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T] # truncate cache to current sequence length
+        if position_ids is not None:
+            if position_ids.ndim == 1:
+                position_ids = position_ids.unsqueeze(0)
+            if position_ids.size(0) == 1 and B > 1:
+                position_ids = position_ids.expand(B, -1)
+            assert position_ids.max() < self.cos.size(1), f"Position ID {position_ids.max()} exceeds rotary cache length {self.cos.size(1)}"
+            cos_table = self.cos.squeeze(0).squeeze(1) # (rotary_seq_len, head_dim/2)
+            sin_table = self.sin.squeeze(0).squeeze(1)
+            cos = F.embedding(position_ids, cos_table).unsqueeze(2) # (B, T, 1, head_dim/2)
+            sin = F.embedding(position_ids, sin_table).unsqueeze(2)
+            cos_sin = (cos, sin)
+        else:
+            assert T <= self.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {T} > {self.cos.size(1)}"
+            # if kv cache exists, we need to offset the rotary embeddings to the current position in the cache
+            T0 = 0 if kv_cache is None else kv_cache.get_pos()
+            cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T] # truncate cache to current sequence length
 
         # Embed the tokens
         x = self.transformer.wte(idx) # embed current token

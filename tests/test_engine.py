@@ -61,6 +61,9 @@ class ByteTokenizer:
             "<|output_end|>": 259,
             "<|assistant_end|>": 260,
             "<|bos|>": 261,
+            "<|user_start|>": 262,
+            "<|user_end|>": 263,
+            "<|assistant_start|>": 264,
         }
         self._bos = 261
 
