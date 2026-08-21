@@ -25,6 +25,11 @@ def _patch_missing_config_keys(model_config_kwargs):
     if "window_pattern" not in model_config_kwargs:
         model_config_kwargs["window_pattern"] = "L"
         log0(f"Patching missing window_pattern in model config to 'L'")
+    # Cycled RoPE is introduced at SFT time, so base checkpoints legitimately have no
+    # stride, as do any chat checkpoints saved before this field existed.
+    if "message_stride" not in model_config_kwargs:
+        model_config_kwargs["message_stride"] = 0
+        log0("Patching missing message_stride in model config to 0 (contiguous positions)")
 
 def _patch_missing_keys(model_data, model_config):
     """Add default values for new parameters that may be missing in old checkpoints."""

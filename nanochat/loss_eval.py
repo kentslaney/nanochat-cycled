@@ -29,8 +29,10 @@ def evaluate_bpb(model, batches, steps, token_bytes):
     total_bytes = torch.tensor(0, dtype=torch.int64, device=model.get_device())
     batch_iter = iter(batches)
     for _ in range(steps):
-        x, y = next(batch_iter)
-        loss2d = model(x, y, loss_reduction='none') # (B, T)
+        # Batches are (x, y), or (x, y, position_ids) when the loader emits cycled-RoPE positions
+        batch = next(batch_iter)
+        x, y, position_ids = batch if len(batch) == 3 else (batch[0], batch[1], None)
+        loss2d = model(x, y, loss_reduction='none', position_ids=position_ids) # (B, T)
         loss2d = loss2d.view(-1) # flatten
         y = y.view(-1) # flatten
         if (y.int() < 0).any(): # mps does not currently have kernel for < 0 for int64, only int32

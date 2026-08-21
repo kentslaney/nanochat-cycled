@@ -16,6 +16,7 @@ import torch.distributed as dist
 from nanochat.common import compute_init, compute_cleanup, get_dist_info, print0, autodetect_device_type
 from nanochat.checkpoint_manager import load_model
 from nanochat.engine import Engine
+from nanochat.tokenizer import compute_conversation_position_ids, conversation_boundaries
 
 from tasks.humaneval import HumanEval
 from tasks.mmlu import MMLU
@@ -89,6 +90,8 @@ def run_categorical_eval(task_object, tokenizer, model, batch_size, max_problems
     ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
     device = model.get_device()
     bos = tokenizer.get_bos_token_id() # use BOS as pad token is ok, these positions are ignored
+    message_stride = getattr(model.config, "message_stride", 0) # cycled RoPE (0 = plain contiguous positions)
+    align_at, align_after = conversation_boundaries(tokenizer) if message_stride > 0 else (None, None)
 
     # We'll process batches of independent problems at a time because there is no sampling needed
     num_problems = len(task_object) if max_problems is None else min(len(task_object), max_problems)
@@ -106,12 +109,23 @@ def run_categorical_eval(task_object, tokenizer, model, batch_size, max_problems
         prompt_ids = [tokenizer.render_for_completion(conversation) for conversation in conversations] # TODO: remake the way this works
         max_length = max(len(ids) for ids in prompt_ids)
         answer_time_positions = [len(ids) - 1 for ids in prompt_ids] # where the last token is (and the predicted answer)
+        # Cycled RoPE: reproduce the message-strided virtual positions the model was trained
+        # with. Positions are computed on the *unpadded* prompt and then simply keep
+        # incrementing across the padding (whose logits are ignored anyway) - running the
+        # tracker over the BOS padding would spend a stride slot per pad token for nothing.
+        position_ids = None
+        if message_stride > 0:
+            positions = []
+            for ids in prompt_ids:
+                p = compute_conversation_position_ids(ids, message_stride, align_at, align_after)
+                positions.append(p + list(range(p[-1] + 1, p[-1] + 1 + max_length - len(ids))))
+            position_ids = torch.tensor(positions, dtype=torch.long, device=device)
         padded_prompt_ids = [ids + [bos] * (max_length - len(ids)) for ids in prompt_ids]
         prompt_ids = torch.tensor(padded_prompt_ids, dtype=torch.long, device=device)
 
         # Get the logits for the whole batch of conversations in parallel (efficiency win here)
         with torch.no_grad():
-            logits = model(prompt_ids) # (B, T, V)
+            logits = model(prompt_ids, position_ids=position_ids) # (B, T, V)
 
         # Focus on the available answer on just the letters corresponding to choices
         # Note that this helps the evaluation a lot because it specifically narrows the focus to only the available letters

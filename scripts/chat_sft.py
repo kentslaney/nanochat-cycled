@@ -47,6 +47,8 @@ parser.add_argument("--num-iterations", type=int, default=-1, help="number of op
 parser.add_argument("--max-seq-len", type=int, default=None, help="max context length (default: inherit from pretrain)")
 parser.add_argument("--device-batch-size", type=int, default=None, help="per-device batch size (default: inherit from pretrain)")
 parser.add_argument("--total-batch-size", type=int, default=None, help="total batch size in tokens (default: inherit from pretrain)")
+# Cycled RoPE: message-strided virtual positions (see nanochat/tokenizer.py for the scheme)
+parser.add_argument("--message-stride", type=int, default=512, help="virtual position stride between messages (0 = plain contiguous positions)")
 # Optimization (default: inherit from pretrained checkpoint)
 parser.add_argument("--embedding-lr", type=float, default=None, help="learning rate for embedding parameters (Adam) (default: inherit from pretrain)")
 parser.add_argument("--unembedding-lr", type=float, default=None, help="learning rate for unembedding parameters (Adam) (default: inherit from pretrain)")
@@ -113,6 +115,16 @@ for name, fallback, source in [
         print0(f"NOTE: --{name.replace('_', '-')}={arg_val} overrides pretrained value of {pretrain_val}")
     else:
         print0(f"Using {name}={arg_val}")
+
+# Cycled RoPE: record the position convention on the model config so that it travels with
+# the checkpoint and inference (Engine, chat_eval) reproduces exactly what we train with.
+# The base checkpoint was pretrained on plain documents, so it never carries a stride.
+model.config.message_stride = args.message_stride
+use_strided_positions = args.message_stride > 0
+if use_strided_positions:
+    print0(f"Cycled RoPE enabled: message_stride={args.message_stride} (user turns on even multiples, assistant turns on odd)")
+else:
+    print0("Cycled RoPE disabled: using plain contiguous positions")
 
 orig_model = model
 model = torch.compile(model, dynamic=False)
@@ -185,6 +197,11 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
     Conversations are packed using best-fit algorithm. When no conversation fits,
     the row is padded (instead of cropping) to ensure no tokens are ever discarded.
     Padding positions have targets masked with -1 (ignore_index for cross-entropy).
+
+    Yields (inputs, targets) normally, or (inputs, targets, position_ids) when cycled RoPE
+    is enabled. Each packed conversation gets its own virtual positions starting from 0;
+    conversations sharing a row cannot see each other anyway (causal mask + BOS alignment),
+    so restarting is both cheaper and closer to how each conversation is seen at inference.
     """
     global last_step, approx_progress, current_epoch
     assert split in {"train", "val"}, "split must be 'train' or 'val'"
@@ -194,7 +211,8 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
     row_capacity = args.max_seq_len + 1  # +1 for target at last position
     bos_token = tokenizer.get_bos_token_id()
 
-    # Conversation buffer: list of (token_ids, loss_mask) tuples
+    # Conversation buffer: list of (token_ids, loss_mask, positions) tuples
+    # (positions is None unless cycled RoPE is enabled)
     conv_buffer = []
     cursor = ddp_rank  # Each rank processes different conversations (for fetching)
     consumed = ddp_rank  # Track actual consumption separately from buffering
@@ -205,8 +223,14 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
         nonlocal cursor, epoch
         while len(conv_buffer) < buffer_size:
             conversation = dataset[cursor]
-            ids, mask = tokenizer.render_conversation(conversation)
-            conv_buffer.append((ids, mask))
+            if use_strided_positions:
+                # Positions are computed here, on CPU, outside the training loop
+                ids, mask, positions = tokenizer.render_conversation(
+                    conversation, message_stride=args.message_stride, return_positions=True)
+            else:
+                ids, mask = tokenizer.render_conversation(conversation)
+                positions = None
+            conv_buffer.append((ids, mask, positions))
             cursor += ddp_world_size
             if cursor >= dataset_size:
                 cursor = cursor % dataset_size
@@ -216,10 +240,12 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
     while True:
         rows = []
         mask_rows = []
+        pos_rows = []
         row_lengths = []  # Track actual content length (excluding padding) for each row
         for _ in range(args.device_batch_size):
             row = []
             mask_row = []
+            pos_row = []
             padded = False
             while len(row) < row_capacity:
                 # Ensure buffer has conversations
@@ -231,7 +257,7 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
                 # Find largest conversation that fits entirely
                 best_idx = -1
                 best_len = 0
-                for i, (conv, _) in enumerate(conv_buffer):
+                for i, (conv, _, _) in enumerate(conv_buffer):
                     conv_len = len(conv)
                     if conv_len <= remaining and conv_len > best_len:
                         best_idx = i
@@ -239,9 +265,11 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
 
                 if best_idx >= 0:
                     # Found a conversation that fits - use it entirely
-                    conv, conv_mask = conv_buffer.pop(best_idx)
+                    conv, conv_mask, conv_pos = conv_buffer.pop(best_idx)
                     row.extend(conv)
                     mask_row.extend(conv_mask)
+                    if conv_pos is not None:
+                        pos_row.extend(conv_pos)  # each conversation restarts its positions at 0
                     consumed += ddp_world_size  # Track actual consumption
                 else:
                     # No conversation fits - pad the remainder instead of cropping
@@ -249,6 +277,10 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
                     content_len = len(row)
                     row.extend([bos_token] * remaining)  # Pad with BOS tokens
                     mask_row.extend([0] * remaining)
+                    if use_strided_positions:
+                        # Padding just continues counting; these targets are masked out below
+                        start = pos_row[-1] + 1 if pos_row else 0
+                        pos_row.extend(range(start, start + remaining))
                     padded = True
                     break  # Row is now full (with padding)
 
@@ -259,6 +291,8 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
                 row_lengths.append(row_capacity)
             rows.append(row[:row_capacity])
             mask_rows.append(mask_row[:row_capacity])
+            if use_strided_positions:
+                pos_rows.append(pos_row[:row_capacity])
 
         # Stopping condition to respect num_iterations, if given
         it += 1
@@ -295,7 +329,14 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
             if content_len < row_capacity:
                 targets[i, content_len-1:] = -1
 
-        yield inputs, targets
+        if not use_strided_positions:
+            yield inputs, targets
+            continue
+
+        # Cycled RoPE: the virtual positions line up with `inputs`, so drop the last column
+        position_ids = torch.tensor(pos_rows, dtype=torch.long, pin_memory=use_cuda)
+        position_ids = position_ids[:, :-1].to(device=device, non_blocking=use_cuda).contiguous()
+        yield inputs, targets, position_ids
 
 train_loader = sft_data_generator_bos_bestfit("train")
 build_val_loader = lambda: sft_data_generator_bos_bestfit("val")
@@ -321,7 +362,14 @@ def get_muon_momentum(it):
 
 # -----------------------------------------------------------------------------
 # Training loop
-x, y = next(train_loader) # prefetch the very first batch of data
+# Batches are (x, y) or (x, y, position_ids) depending on cycled RoPE; unpack uniformly.
+# Note the shape of the batch is fixed for the whole run, so torch.compile(dynamic=False)
+# still only ever sees one graph.
+def next_batch():
+    batch = next(train_loader)
+    return batch if len(batch) == 3 else (batch[0], batch[1], None)
+
+x, y, pos = next_batch() # prefetch the very first batch of data
 min_val_bpb = float("inf")
 smooth_train_loss = 0 # EMA of training loss
 ema_beta = 0.9 # EMA decay factor
@@ -408,6 +456,7 @@ while True:
                     "n_kv_head": model.config.n_kv_head,
                     "n_embd": model.config.n_embd,
                     "window_pattern": model.config.window_pattern,
+                    "message_stride": args.message_stride, # cycled RoPE convention, needed at inference
                 },
                 "user_config": user_config, # inputs to the training script
             },
@@ -423,14 +472,14 @@ while True:
     synchronize()
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
-        loss = model(x, y)
+        loss = model(x, y, position_ids=pos)
         train_loss = loss.detach() # for logging
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         if scaler is not None:
             scaler.scale(loss).backward()
         else:
             loss.backward()
-        x, y = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
+        x, y, pos = next_batch() # prefetch the next batch while the GPU is busy with forward/backward
         progress = max(progress, approx_progress) # only increase progress monotonically
     # step the optimizer
     lrm = get_lr_multiplier(progress)

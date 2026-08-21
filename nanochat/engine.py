@@ -19,6 +19,7 @@ from contextlib import contextmanager
 from collections import deque
 from nanochat.common import compute_init, autodetect_device_type, COMPUTE_DTYPE
 from nanochat.checkpoint_manager import load_model
+from nanochat.tokenizer import PositionTracker, conversation_boundaries
 
 # -----------------------------------------------------------------------------
 # Calculator tool helpers
@@ -159,18 +160,29 @@ def sample_next_token(logits, rng, temperature=1.0, top_k=None):
 
 class RowState:
     # Per-row state tracking during generation
-    def __init__(self, current_tokens=None):
+    def __init__(self, current_tokens=None, position_tracker=None):
         self.current_tokens = current_tokens or [] # Current token sequence for this row
         self.forced_tokens = deque() # Queue of tokens to force inject
         self.in_python_block = False # Whether we are inside a python block
         self.python_expr_tokens = [] # Tokens of the current python expression
         self.completed = False # Whether this row has completed generation
+        self.position_tracker = position_tracker # Cycled-RoPE virtual position state (or None)
 
 class Engine:
 
     def __init__(self, model, tokenizer):
         self.model = model
         self.tokenizer = tokenizer # needed for tool use
+        # Cycled RoPE: if the model was trained with message-strided positions we must
+        # reproduce the exact same position scheme at inference time, otherwise the
+        # positions the model sees will not match anything it was trained on.
+        self.message_stride = getattr(model.config, "message_stride", 0)
+        self.strided_positions = self.message_stride > 0
+        if self.strided_positions:
+            self.align_at, self.align_after = conversation_boundaries(tokenizer)
+
+    def _new_position_tracker(self):
+        return PositionTracker(self.message_stride, self.align_at, self.align_after)
 
     @torch.inference_mode()
     def generate(self, tokens, num_samples=1, max_tokens=None, temperature=1.0, top_k=None, seed=42):
@@ -202,7 +214,16 @@ class Engine:
             **kv_model_kwargs,
         )
         ids = torch.tensor([tokens], dtype=torch.long, device=device)
-        logits = self.model.forward(ids, kv_cache=kv_cache_prefill)
+        # Cycled RoPE: walk the prompt through the position state machine so the prefill
+        # sees the same message-strided positions the model was trained on.
+        prefill_tracker = None
+        prefill_positions = None
+        if self.strided_positions:
+            prefill_tracker = self._new_position_tracker()
+            prefill_positions = torch.tensor(
+                [prefill_tracker.extend(tokens)], dtype=torch.long, device=device
+            )
+        logits = self.model.forward(ids, kv_cache=kv_cache_prefill, position_ids=prefill_positions)
         logits = logits[:, -1, :].expand(num_samples, -1)  # (num_samples, vocab_size)
 
         # 2) Replicate the KV cache for each sample/row
@@ -217,8 +238,12 @@ class Engine:
         kv_cache_decode.prefill(kv_cache_prefill)
         del kv_cache_prefill # no need to keep this memory around
 
-        # 3) Initialize states for each sample
-        row_states = [RowState(tokens.copy()) for _ in range(num_samples)]
+        # 3) Initialize states for each sample. Each row continues the prompt's position
+        # state independently, since rows diverge as soon as they sample different tokens.
+        row_states = [
+            RowState(tokens.copy(), prefill_tracker.clone() if prefill_tracker is not None else None)
+            for _ in range(num_samples)
+        ]
 
         # 4) Main generation loop
         num_generated = 0
@@ -237,12 +262,18 @@ class Engine:
             # Process each row: choose the next token, update state, optional tool use
             token_column = [] # contains the next token id along each row
             token_masks = [] # contains the mask (was it sampled (1) or forced (0)?) along each row
+            position_column = [] # contains the virtual RoPE position along each row
             for i, state in enumerate(row_states):
                 # Select the next token in this row
                 is_forced = len(state.forced_tokens) > 0 # are there tokens waiting to be forced in deque?
                 token_masks.append(0 if is_forced else 1) # mask is 0 if forced, 1 if sampled
                 next_token = state.forced_tokens.popleft() if is_forced else sampled_tokens[i]
                 token_column.append(next_token)
+                # Advance this row's virtual position. Note the special tokens that realign it
+                # (assistant_start, python_start, output_start, ...) may be either sampled by
+                # the model or force-injected by the tool loop - both go through here.
+                if state.position_tracker is not None:
+                    position_column.append(state.position_tracker.step(next_token))
                 # Update the state of this row to include the next token
                 state.current_tokens.append(next_token)
                 # On <|assistant_end|> or <|bos|>, mark the row as completed
@@ -272,7 +303,10 @@ class Engine:
 
             # Prepare logits for next iteration
             ids = torch.tensor(token_column, dtype=torch.long, device=device).unsqueeze(1)
-            logits = self.model.forward(ids, kv_cache=kv_cache_decode)[:, -1, :]  # (B, vocab_size)
+            positions = None
+            if position_column:
+                positions = torch.tensor(position_column, dtype=torch.long, device=device).unsqueeze(1)  # (B, 1)
+            logits = self.model.forward(ids, kv_cache=kv_cache_decode, position_ids=positions)[:, -1, :]  # (B, vocab_size)
 
     def generate_batch(self, tokens, num_samples=1, **kwargs):
         """

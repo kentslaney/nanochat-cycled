@@ -20,6 +20,7 @@ class MockConfig:
     n_embd: int = 64
     n_layer: int = 2
     sequence_len: int = 128
+    message_stride: int = 0  # cycled RoPE off, so these tests run the contiguous path
 
 
 class MockModel:
@@ -28,17 +29,19 @@ class MockModel:
     This ensures that with temperature > 0, different samples should
     (with very high probability) produce different tokens.
     """
-    def __init__(self, vocab_size=262):  # 256 bytes + 6 special tokens
+    def __init__(self, vocab_size=262, message_stride=0):  # 256 bytes + 6 special tokens
         self.vocab_size = vocab_size
-        self.config = MockConfig()
+        self.config = MockConfig(message_stride=message_stride)
         self._device = torch.device("cpu")
+        self.seen_position_ids = []  # every position_ids the Engine passed us, in order
 
     def get_device(self):
         return self._device
 
-    def forward(self, ids, kv_cache=None):
+    def forward(self, ids, kv_cache=None, position_ids=None):
         """Return uniform logits so sampling is spread across vocab."""
         B, T = ids.shape
+        self.seen_position_ids.append(None if position_ids is None else position_ids.tolist())
         # With FA3, flash_attn_with_kvcache updates cache in-place and we advance position
         if kv_cache is not None:
             kv_cache.advance(T)

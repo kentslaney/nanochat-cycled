@@ -10,10 +10,12 @@ Notable features:
 - no bias in linear layers
 - Group-Query Attention (GQA) support for more efficient inference
 - Flash Attention 3 integration
+- Cycled RoPE: optional message-strided virtual positions (see GPTConfig.message_stride)
 """
 
 from functools import partial
 from dataclasses import dataclass
+from typing import NamedTuple, Optional
 
 import torch
 import torch.nn as nn
@@ -37,6 +39,16 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (quarter context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    # Cycled RoPE: virtual position stride between conversation messages (0 = disabled,
+    # i.e. plain contiguous positions). When > 0, message boundaries jump the *virtual*
+    # position to a stride-aligned value with speaker parity (user turns land on even
+    # multiples of the stride, assistant turns on odd ones), so a response's positional
+    # encoding does not depend on the lengths of the messages before it. This only
+    # changes which positions are fed to RoPE - no parameters or dimensions are added.
+    # The model itself never computes positions: they arrive via forward(position_ids=...).
+    # This field exists so that a checkpoint records the convention it was trained with,
+    # and so inference (Engine) can reproduce it.
+    message_stride: int = 0
 
 
 def norm(x):
@@ -64,6 +76,68 @@ def apply_rotary_emb(x, cos, sin):
     y2 = x1 * (-sin) + x2 * cos
     return torch.cat([y1, y2], 3)
 
+
+def rotary_cos_sin(position_ids, inv_freq, dtype):
+    """
+    Compute cos/sin directly from (possibly non-contiguous) position values.
+    position_ids: (B, T) integer tensor of virtual positions
+    inv_freq:     (head_dim/2,) float32
+    Returns two (B, T, 1, head_dim/2) tensors, broadcastable over heads.
+    Note we deliberately do NOT index into a precomputed table: with message-strided
+    positions the table would have to span the whole (mostly unused) virtual range.
+    """
+    freqs = position_ids.to(torch.float32).unsqueeze(-1) * inv_freq  # (B, T, head_dim/2)
+    freqs = freqs.unsqueeze(2)  # (B, T, 1, head_dim/2), the 1 broadcasts over heads
+    return freqs.cos().to(dtype), freqs.sin().to(dtype)
+
+
+class _RotaryStrided(torch.autograd.Function):
+    """
+    Apply rotary embeddings from explicit position ids, recomputing cos/sin on backward.
+
+    Why a custom autograd Function: with per-example positions, cos/sin are (B, T, 1, D/2)
+    rather than the broadcast (1, T, 1, D/2) of the contiguous path, and `y = x * cos` saves
+    them for backward. At B=32, T=2048, D/2=64 that is ~17MB of graph that buys nothing -
+    cos/sin are cheap to recompute. So we save only position_ids (B, T int32/int64, ~0.5MB,
+    and the *same* tensor is shared by every layer) plus inv_freq (D/2 floats), and redo the
+    two trig calls in backward. q and k are rotated together so one cos/sin serves both.
+    """
+
+    @staticmethod
+    def forward(ctx, q, k, position_ids, inv_freq):
+        cos, sin = rotary_cos_sin(position_ids, inv_freq, q.dtype)
+        ctx.save_for_backward(position_ids, inv_freq)
+        return apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
+
+    @staticmethod
+    def backward(ctx, dq, dk):
+        position_ids, inv_freq = ctx.saved_tensors
+        cos, sin = rotary_cos_sin(position_ids, inv_freq, dq.dtype)
+        # The rotation is orthogonal, so its Jacobian-transpose is the inverse rotation,
+        # which is just the same op with sin negated.
+        return apply_rotary_emb(dq, cos, -sin), apply_rotary_emb(dk, cos, -sin), None, None
+
+
+def apply_rotary_emb_strided(q, k, position_ids, inv_freq):
+    """Rotate q and k by the angles implied by position_ids (see _RotaryStrided)."""
+    assert q.ndim == 4 and k.ndim == 4
+    assert position_ids.ndim == 2, f"position_ids must be (B, T), got {tuple(position_ids.shape)}"
+    return _RotaryStrided.apply(q, k, position_ids, inv_freq)
+
+
+class Rotary(NamedTuple):
+    """
+    How a forward pass should rotate q/k. Exactly one of the two modes is populated:
+    - contiguous path: cos/sin are slices of the model's precomputed table (1, T, 1, D/2)
+    - strided path:    position_ids (B, T) + inv_freq (D/2,), cos/sin computed on the fly
+    A run picks one mode and sticks to it, so torch.compile sees a single graph shape.
+    """
+    cos: Optional[torch.Tensor] = None
+    sin: Optional[torch.Tensor] = None
+    position_ids: Optional[torch.Tensor] = None
+    inv_freq: Optional[torch.Tensor] = None
+
+
 class CausalSelfAttention(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
@@ -81,7 +155,7 @@ class CausalSelfAttention(nn.Module):
         self.ve_gate_channels = 12
         self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache):
+    def forward(self, x, ve, rotary, window_size, kv_cache):
         B, T, C = x.size()
 
         # Project the input to get queries, keys, and values
@@ -97,8 +171,11 @@ class CausalSelfAttention(nn.Module):
             v = v + gate.unsqueeze(-1) * ve
 
         # Apply Rotary Embeddings to queries and keys to get relative positional encoding
-        cos, sin = cos_sin
-        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
+        if rotary.position_ids is None:
+            cos, sin = rotary.cos, rotary.sin
+            q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
+        else:
+            q, k = apply_rotary_emb_strided(q, k, rotary.position_ids, rotary.inv_freq)
         q, k = norm(q), norm(k) # QK norm
         q = q * 1.2  # sharper attention (split scale between Q and K), TODO think through better
         k = k * 1.2
@@ -147,8 +224,8 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
+    def forward(self, x, ve, rotary, window_size, kv_cache):
+        x = x + self.attn(norm(x), ve, rotary, window_size, kv_cache)
         x = x + self.mlp(norm(x))
         return x
 
@@ -194,11 +271,14 @@ class GPT(nn.Module):
         # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
         # so let's just over-compute them by 10X, but assert fail if we ever reach that amount.
         # In the future we can dynamically grow the cache, for now it's fine.
+        # Note the table only ever has to cover *contiguous* positions: the message-strided
+        # path computes cos/sin from position values directly and needs no table at all.
         self.rotary_seq_len = config.sequence_len * 10 # 10X over-compute should be enough, TODO make nicer?
         head_dim = config.n_embd // config.n_head
-        cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
+        cos, sin, inv_freq = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
         self.register_buffer("cos", cos, persistent=False) # persistent=False means it's not saved to the checkpoint
         self.register_buffer("sin", sin, persistent=False)
+        self.register_buffer("inv_freq", inv_freq, persistent=False) # (head_dim/2,) fp32, used by the strided path
 
     @torch.no_grad()
     def init_weights(self):
@@ -256,8 +336,8 @@ class GPT(nn.Module):
 
         # Rotary embeddings
         head_dim = self.config.n_embd // self.config.n_head
-        cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
-        self.cos, self.sin = cos, sin
+        cos, sin, inv_freq = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
+        self.cos, self.sin, self.inv_freq = cos, sin, inv_freq
 
         # Cast embeddings to COMPUTE_DTYPE: optimizer can tolerate reduced-precision
         # embeddings and it saves memory. Exception: fp16 requires fp32 embeddings
@@ -282,7 +362,8 @@ class GPT(nn.Module):
         cos, sin = freqs.cos(), freqs.sin()
         cos, sin = cos.to(COMPUTE_DTYPE), sin.to(COMPUTE_DTYPE)
         cos, sin = cos[None, :, None, :], sin[None, :, None, :] # add batch and head dims for later broadcasting
-        return cos, sin
+        # inv_freq is returned too: the message-strided path computes cos/sin from it on the fly
+        return cos, sin, inv_freq
 
     def _compute_window_sizes(self, config):
         """
@@ -456,16 +537,24 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
+    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', position_ids=None):
         B, T = idx.size()
 
-        # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
-        assert T <= self.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {T} > {self.cos.size(1)}"
-        assert idx.device == self.cos.device, f"Rotary embeddings and idx are on different devices: {idx.device} != {self.cos.device}"
-        assert self.cos.dtype == COMPUTE_DTYPE, f"Rotary embeddings must be in {COMPUTE_DTYPE}, got {self.cos.dtype}"
-        # if kv cache exists, we need to offset the rotary embeddings to the current position in the cache
-        T0 = 0 if kv_cache is None else kv_cache.get_pos()
-        cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T] # truncate cache to current sequence length
+        # Resolve how q/k get rotated. Two mutually exclusive modes, see the Rotary docstring.
+        if position_ids is None:
+            # Contiguous positions: slice the precomputed table (shape (1, seq_len, 1, head_dim/2))
+            assert T <= self.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {T} > {self.cos.size(1)}"
+            assert idx.device == self.cos.device, f"Rotary embeddings and idx are on different devices: {idx.device} != {self.cos.device}"
+            assert self.cos.dtype == COMPUTE_DTYPE, f"Rotary embeddings must be in {COMPUTE_DTYPE}, got {self.cos.dtype}"
+            # if kv cache exists, we need to offset the rotary embeddings to the current position in the cache
+            T0 = 0 if kv_cache is None else kv_cache.get_pos()
+            rotary = Rotary(cos=self.cos[:, T0:T0+T], sin=self.sin[:, T0:T0+T]) # truncate cache to current sequence length
+        else:
+            # Explicit (possibly message-strided) positions: compute cos/sin on the fly.
+            # No table is consulted, so positions may exceed rotary_seq_len - that is the point.
+            assert position_ids.shape == (B, T), f"position_ids must be {(B, T)}, got {tuple(position_ids.shape)}"
+            assert position_ids.device == idx.device, f"position_ids and idx are on different devices: {position_ids.device} != {idx.device}"
+            rotary = Rotary(position_ids=position_ids, inv_freq=self.inv_freq)
 
         # Embed the tokens
         x = self.transformer.wte(idx) # embed current token
@@ -499,7 +588,7 @@ class GPT(nn.Module):
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
-            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
+            x = block(x, ve, rotary, self.window_sizes[i], kv_cache)
             if i == backout_layer:
                 x_backout = x
         # Subtract mid-layer residual to remove low-level features before logit projection
@@ -530,6 +619,10 @@ class GPT(nn.Module):
         To make it super simple, let's assume:
         - batch size is 1
         - ids and the yielded tokens are simple Python lists and ints
+        Note: this path always uses contiguous positions. For a model trained with
+        config.message_stride > 0, use Engine.generate instead, which reproduces the
+        message-strided positions (this function has no access to the tokenizer's
+        special token ids and is only meant as a simple reference implementation).
         """
         assert isinstance(tokens, list)
         device = self.get_device()
