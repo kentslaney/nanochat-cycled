@@ -2,6 +2,8 @@
 
 made a copy since I [thought](https://github.com/karpathy/nanochat/discussions/1#discussioncomment-14766333) the "new chat" token could be a buffer in the positional embedding
 
+[local config](https://github.com/kentslaney/dgx-spark-playbooks)
+
 ## prompted changes
 If we know we're encoding conversations, I don't think it makes sense for the positional embeddings of the response to depend on the lengths of previous messages. Intuitively, if the positional embeddings were wavelets (doubling), I would want to pad the position out to a new cycle where the phase of a certain level down re-aligns. In the context of RoPE embeddings, I would extend backwards to "negative dimension numbers" so that, no matter how many messages there are, the positional encoding from the start of the message is the same for the non-negative dimensions, and set a fixed cutoff for the number of "who's talking" ("negative") dimensions. One complication is that this adds dimensions that weren't trained on in the base checkpoint, there'll have to be a second weight initialiation phase since the base checkpoint takes ~10 times longer than SFT. The other complication is that the cycle frequency doesn't just double, so I'm less sure how to think about the phase re-alignment.
 
