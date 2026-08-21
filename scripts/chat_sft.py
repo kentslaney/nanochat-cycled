@@ -11,6 +11,7 @@ torchrun --standalone --nproc_per_node=8 -m scripts.chat_sft -- --device-batch-s
 
 import gc
 import argparse
+import hashlib
 import os
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import time
@@ -25,7 +26,7 @@ from nanochat.flash_attention import HAS_FA3
 from nanochat.engine import Engine
 from scripts.chat_eval import run_chat_eval
 
-from tasks.common import TaskMixture
+from tasks.common import TaskMixture, RenderCache
 from tasks.gsm8k import GSM8K
 from tasks.mmlu import MMLU
 from tasks.smoltalk import SmolTalk
@@ -183,6 +184,19 @@ val_dataset = TaskMixture([
     MMLU(subset="all", split="test", stop=5200), # 14K rows in test set, use only 5.2K to match the train ratios
     GSM8K(subset="main", split="test", stop=420), # 1.32K rows in test set, use only 420 to match the train ratios
 ]) # total: 24K + 5.2K + 0.42K ~= 29.6K rows
+
+# Precompute ids/mask/(cycled-RoPE positions) for every conversation and memory-map them
+# from disk, so the CPU-bound tokenization + per-token position loop runs once here instead
+# of blocking the training loop on every epoch / every relaunch.
+with open(os.path.join(get_base_dir(), "tokenizer", "tokenizer.pkl"), "rb") as f:
+    tokenizer_fingerprint = hashlib.sha1(f.read()).hexdigest()[:16]
+train_render_cache = RenderCache(
+    train_dataset, tokenizer, args.message_stride,
+    cache_key=f"train_ms{args.message_stride}_mmlu{args.mmlu_epochs}_gsm8k{args.gsm8k_epochs}_{tokenizer_fingerprint}")
+val_render_cache = RenderCache(
+    val_dataset, tokenizer, args.message_stride,
+    cache_key=f"val_ms{args.message_stride}_{tokenizer_fingerprint}")
+
 # DataLoader is defined here, it emits inputs, targets : 2D tensors of shape (device_batch_size, max_seq_len)
 # A big problem is that we don't know the final num_iterations in advance. So we create
 # these two global variables and update them from within the data generator.
@@ -205,7 +219,7 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
     """
     global last_step, approx_progress, current_epoch
     assert split in {"train", "val"}, "split must be 'train' or 'val'"
-    dataset = train_dataset if split == "train" else val_dataset
+    dataset = train_render_cache if split == "train" else val_render_cache
     dataset_size = len(dataset)
     assert dataset_size > 0
     row_capacity = args.max_seq_len + 1  # +1 for target at last position
@@ -222,14 +236,9 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
     def refill_buffer():
         nonlocal cursor, epoch
         while len(conv_buffer) < buffer_size:
-            conversation = dataset[cursor]
-            if use_strided_positions:
-                # Positions are computed here, on CPU, outside the training loop
-                ids, mask, positions = tokenizer.render_conversation(
-                    conversation, message_stride=args.message_stride, return_positions=True)
-            else:
-                ids, mask = tokenizer.render_conversation(conversation)
-                positions = None
+            # ids/mask/positions come straight out of the precomputed RenderCache mmap,
+            # no tokenization or position computation happens in the training loop
+            ids, mask, positions = dataset[cursor]
             conv_buffer.append((ids, mask, positions))
             cursor += ddp_world_size
             if cursor >= dataset_size:

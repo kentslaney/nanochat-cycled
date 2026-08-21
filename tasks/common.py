@@ -82,6 +82,77 @@ def load_hub_dataset(repo_id, subset="default", split="train"):
     return HubDataset(table)
 
 
+class RenderCache:
+    """
+    Precomputes tokenizer.render_conversation(ids, mask, positions) for every row of
+    `dataset` and memory-maps the result from disk, so training never re-tokenizes or
+    re-runs the (pure-Python, per-token) cycled-RoPE position loop on the fly. Built once
+    per unique `cache_key`, guarded by a FileLock exactly like load_hub_dataset above:
+    under torchrun, only one rank renders and the others block, then all reread.
+    """
+
+    def __init__(self, dataset, tokenizer, message_stride, cache_key):
+        base_dir = get_base_dir()
+        cache_dir = os.path.join(base_dir, "sft_render_cache", cache_key)
+        manifest_path = os.path.join(cache_dir, "manifest.json")
+        if not os.path.exists(manifest_path):
+            os.makedirs(cache_dir, exist_ok=True)
+            with FileLock(manifest_path + ".lock"):
+                # only a single rank acquires the lock and renders, the others block
+                # here and then skip rendering because they recheck the manifest
+                if not os.path.exists(manifest_path):
+                    self._build(dataset, tokenizer, message_stride, cache_dir, manifest_path)
+        with open(manifest_path, "r") as f:
+            manifest = json.load(f)
+        self.message_stride = manifest["message_stride"]
+        self.num_conversations = manifest["num_conversations"]
+        self.offsets = np.load(os.path.join(cache_dir, "offsets.npy"))
+        self.ids = np.load(os.path.join(cache_dir, "ids.npy"), mmap_mode="r")
+        self.mask = np.load(os.path.join(cache_dir, "mask.npy"), mmap_mode="r")
+        self.positions = None
+        if self.message_stride > 0:
+            self.positions = np.load(os.path.join(cache_dir, "positions.npy"), mmap_mode="r")
+
+    @staticmethod
+    def _build(dataset, tokenizer, message_stride, cache_dir, manifest_path):
+        n = len(dataset)
+        offsets = np.empty(n + 1, dtype=np.int64)
+        offsets[0] = 0
+        ids_parts, mask_parts, pos_parts = [], [], []
+        for i in range(n):
+            if message_stride > 0:
+                ids, mask, positions = tokenizer.render_conversation(
+                    dataset[i], message_stride=message_stride, return_positions=True)
+            else:
+                ids, mask = tokenizer.render_conversation(dataset[i])
+                positions = None
+            ids_parts.append(np.asarray(ids, dtype=np.int32))
+            mask_parts.append(np.asarray(mask, dtype=np.int8))
+            if positions is not None:
+                pos_parts.append(np.asarray(positions, dtype=np.int32))
+            offsets[i + 1] = offsets[i] + len(ids)
+            if i % 20000 == 0:
+                print(f"Rendering SFT cache ({cache_dir}): {i}/{n} conversations")
+        empty = lambda dtype: np.zeros(0, dtype=dtype)
+        np.save(os.path.join(cache_dir, "offsets.npy"), offsets)
+        np.save(os.path.join(cache_dir, "ids.npy"), np.concatenate(ids_parts) if ids_parts else empty(np.int32))
+        np.save(os.path.join(cache_dir, "mask.npy"), np.concatenate(mask_parts) if mask_parts else empty(np.int8))
+        if message_stride > 0:
+            np.save(os.path.join(cache_dir, "positions.npy"), np.concatenate(pos_parts) if pos_parts else empty(np.int32))
+        with open(manifest_path, "w") as f:
+            json.dump({"num_conversations": n, "message_stride": message_stride}, f)
+
+    def __len__(self):
+        return self.num_conversations
+
+    def __getitem__(self, index):
+        start, end = int(self.offsets[index]), int(self.offsets[index + 1])
+        ids = self.ids[start:end].tolist()
+        mask = self.mask[start:end].tolist()
+        positions = self.positions[start:end].tolist() if self.positions is not None else None
+        return ids, mask, positions
+
+
 class Task:
     """
     Base class of a Task. Allows for lightweight slicing of the underlying dataset.
