@@ -223,3 +223,47 @@ def test_compute_conversation_position_ids_with_python_tools():
     assert positions[5] == 512 # assistant_start
     assert positions[10] == 1024 # output_start (even parity)
 
+
+def test_gpt_forward_on_device_position_ids_auto_computation():
+    tok = MockTokenizer()
+    stride = 512
+    config = GPTConfig(
+        sequence_len=256,
+        vocab_size=1000,
+        n_layer=2,
+        n_head=2,
+        n_kv_head=2,
+        n_embd=64,
+        message_stride=stride,
+    )
+    model = GPT(config)
+    model.set_special_tokens_from_tokenizer(tok)
+    model.init_weights()
+    model.eval()
+
+    device = model.get_device()
+
+    # Create a conversation sequence
+    tokens = [
+        tok.get_bos_token_id(),
+        tok.encode_special("<|user_start|>"),
+        50, 51,
+        tok.encode_special("<|user_end|>"),
+        tok.encode_special("<|assistant_start|>"),
+        60, 61,
+        tok.encode_special("<|assistant_end|>"),
+    ]
+    idx = torch.tensor([tokens, tokens], device=device) # (B=2, T)
+
+    # 1. Forward WITHOUT position_ids -> auto-computes on device
+    out_auto = model.forward(idx)
+
+    # 2. Forward with explicitly computed position_ids
+    expected_pos = compute_conversation_position_ids(tokens, tok, message_stride=stride)
+    pos_tensor = torch.tensor([expected_pos, expected_pos], device=device)
+    out_explicit = model.forward(idx, position_ids=pos_tensor)
+
+    # Output should be identical
+    assert torch.allclose(out_auto, out_explicit, atol=1e-5)
+
+

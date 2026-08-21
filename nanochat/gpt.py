@@ -458,12 +458,73 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
+    def set_special_tokens(self, user_start=None, assistant_start=None, output_start=None, output_end=None):
+        self.user_start_id = user_start
+        self.assistant_start_id = assistant_start
+        self.output_start_id = output_start
+        self.output_end_id = output_end
+
+    def set_special_tokens_from_tokenizer(self, tokenizer):
+        def get_tok(s):
+            try:
+                return tokenizer.encode_special(s)
+            except Exception:
+                return None
+        self.user_start_id = get_tok("<|user_start|>")
+        self.assistant_start_id = get_tok("<|assistant_start|>")
+        self.output_start_id = get_tok("<|output_start|>")
+        self.output_end_id = get_tok("<|output_end|>")
+
+    @torch.no_grad()
+    def compute_on_device_position_ids(self, idx):
+        """Compute message-strided parity position IDs directly on device tensor with zero disk I/O."""
+        B, T = idx.shape
+        device = idx.device
+        stride = self.config.message_stride
+        user_start = getattr(self, 'user_start_id', None)
+        asst_start = getattr(self, 'assistant_start_id', None)
+        out_start = getattr(self, 'output_start_id', None)
+        out_end = getattr(self, 'output_end_id', None)
+        if user_start is None:
+            user_start, asst_start, out_start, out_end = 2, 4, 8, 9
+
+        pos_ids = torch.empty((B, T), dtype=torch.long, device=device)
+        for b in range(B):
+            row = idx[b]
+            cur_pos = 0
+            after_out_end = False
+            for t in range(T):
+                tok = row[t].item()
+                if t == 0:
+                    cur_pos = 0
+                elif tok == user_start or tok == out_start:
+                    after_out_end = False
+                    if cur_pos > 1:
+                        k = (cur_pos + 2 * stride - 1) // (2 * stride)
+                        cur_pos = k * 2 * stride
+                elif tok == asst_start or after_out_end:
+                    after_out_end = False
+                    rem = cur_pos - stride
+                    if rem <= 0:
+                        cur_pos = stride
+                    else:
+                        k = (rem + 2 * stride - 1) // (2 * stride)
+                        cur_pos = (2 * k + 1) * stride
+                pos_ids[b, t] = cur_pos
+                cur_pos += 1
+                if tok == out_end:
+                    after_out_end = True
+        return pos_ids
+
     def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', position_ids=None):
         B, T = idx.size()
 
         # Grab the rotary embeddings for the current sequence length
         assert idx.device == self.cos.device, f"Rotary embeddings and idx are on different devices: {idx.device} != {self.cos.device}"
         assert self.cos.dtype == COMPUTE_DTYPE, f"Rotary embeddings must be in {COMPUTE_DTYPE}, got {self.cos.dtype}"
+        if position_ids is None and getattr(self.config, 'message_stride', 0) > 0 and kv_cache is None:
+            position_ids = self.compute_on_device_position_ids(idx)
+
         if position_ids is not None:
             if position_ids.ndim == 1:
                 position_ids = position_ids.unsqueeze(0)
